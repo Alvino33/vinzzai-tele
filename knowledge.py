@@ -1,6 +1,8 @@
 import json
+import logging
 import os
 import re
+import subprocess
 import threading
 from pathlib import Path
 
@@ -8,6 +10,7 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 USERS_DIR = DATA_DIR / "users"
 LEGACY_FILE = DATA_DIR / "materials.jsonl"
 _LOCK = threading.Lock()
+log = logging.getLogger(__name__)
 
 SUBJECTS = {
     "matematika": {
@@ -84,6 +87,50 @@ SUBJECTS = {
 }
 
 
+def _git_sync_data() -> None:
+    """Commit and push the persistent materials directory to the repository."""
+    if os.getenv("GITHUB_ACTIONS", "").lower() != "true":
+        log.info("Di luar GitHub Actions; perubahan materi hanya disimpan lokal.")
+        return
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+
+    try:
+        git("config", "user.name", "VinAI Bot")
+        git("config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
+        git("add", "-A", str(USERS_DIR))
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--quiet", "--", str(USERS_DIR)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if staged.returncode == 0:
+            return
+        if staged.returncode != 1:
+            raise RuntimeError(staged.stderr or "Gagal memeriksa perubahan Git.")
+
+        git("commit", "-m", "Simpan/update materi VinAI")
+        git("pull", "--rebase", "origin", "main")
+        git("push", "origin", "HEAD:main")
+        log.info("Materi berhasil disinkronkan ke repository.")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        detail = getattr(exc, "stderr", "") or str(exc)
+        log.exception("Gagal menyimpan materi ke GitHub: %s", detail)
+        raise RuntimeError(
+            "Gagal menyimpan materi permanen ke GitHub. Pastikan Actions punya "
+            "izin Contents: Read and write, lalu coba lagi."
+        ) from exc
+
+
 def _words(text: str) -> list[str]:
     return re.findall(r"[a-zA-Z0-9À-ÿ]+", text.lower())
 
@@ -114,11 +161,8 @@ def detect_subject(text: str) -> str:
                 score += 3 if " " in keyword else 1
         if score:
             scores[key] = score
-
-    # Soal hitung sederhana sering tidak menyebut kata "matematika".
     if re.search(r"\d\s*[+×x*/÷=-]\s*\d", normalized):
         scores["matematika"] = scores.get("matematika", 0) + 2
-
     if not scores:
         return "lainnya"
     return max(scores, key=scores.get)
@@ -155,17 +199,15 @@ def add_material(user_id: int, title: str, text: str, subject: str | None = None
     target = _subject_file(user_id, subject)
     target.parent.mkdir(parents=True, exist_ok=True)
     rows = [
-        {
-            "user_id": int(user_id),
-            "subject": subject,
-            "title": title[:180],
-            "text": chunk,
-        }
+        {"user_id": int(user_id), "subject": subject, "title": title[:180], "text": chunk}
         for chunk in chunks
     ]
     with _LOCK, target.open("a", encoding="utf-8") as file:
         for row in rows:
             file.write(json.dumps(row, ensure_ascii=False) + "\n")
+        file.flush()
+        os.fsync(file.fileno())
+        _git_sync_data()
     return len(rows)
 
 
@@ -194,12 +236,8 @@ def _load_user_rows(user_id: int) -> list[dict]:
                 for row in _read_jsonl(path, user_id):
                     row.setdefault("subject", subject)
                     rows.append(row)
-
-        # Baca data dari versi lama agar materi lama tidak langsung hilang.
         for row in _read_jsonl(LEGACY_FILE, user_id):
-            row.setdefault("subject", detect_subject(
-                f"{row.get('title', '')}\n{row.get('text', '')}"
-            ))
+            row.setdefault("subject", detect_subject(f"{row.get('title', '')}\n{row.get('text', '')}"))
             rows.append(row)
     return rows
 
@@ -208,21 +246,16 @@ def retrieve(user_id: int, question: str, limit: int = 6) -> list[dict]:
     query_words = set(_words(question))
     if not query_words:
         return []
-
     rows = _load_user_rows(user_id)
     detected = detect_subject(question)
     if detected != "lainnya":
         same_subject = [row for row in rows if row.get("subject") == detected]
         if same_subject:
             rows = same_subject
-
     scored = []
     for row in rows:
-        text = row.get("text", "")
-        title = row.get("title", "")
-        words = _words(f"{title} {text}")
-        word_set = set(words)
-        overlap = query_words & word_set
+        words = _words(f"{row.get('title', '')} {row.get('text', '')}")
+        overlap = query_words & set(words)
         if not overlap:
             continue
         score = sum(1 + min(words.count(word), 3) * 0.15 for word in overlap)
@@ -233,8 +266,7 @@ def retrieve(user_id: int, question: str, limit: int = 6) -> list[dict]:
 
 
 def list_materials(user_id: int, subject: str | None = None) -> list[str]:
-    titles = []
-    seen = set()
+    titles, seen = [], set()
     for row in _load_user_rows(user_id):
         if subject and row.get("subject") != subject:
             continue
@@ -271,8 +303,6 @@ def clear_materials(user_id: int) -> int:
                     path.unlink(missing_ok=True)
                 except OSError:
                     continue
-
-        # Hapus juga data lama milik user ini, sambil mempertahankan user lain.
         if LEGACY_FILE.exists():
             kept = []
             with LEGACY_FILE.open("r", encoding="utf-8") as file:
@@ -288,7 +318,8 @@ def clear_materials(user_id: int) -> int:
             temp_file = LEGACY_FILE.with_suffix(".tmp")
             temp_file.write_text("".join(kept), encoding="utf-8")
             temp_file.replace(LEGACY_FILE)
-
         if user_dir.exists() and not any(user_dir.iterdir()):
             user_dir.rmdir()
+        if removed:
+            _git_sync_data()
     return removed
