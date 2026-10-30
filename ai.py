@@ -9,7 +9,11 @@ def _client():
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY belum diatur di environment.")
-    return genai.Client(api_key=api_key)
+    timeout_ms = int(os.getenv("GEMINI_TIMEOUT_MS", "45000"))
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=timeout_ms),
+    )
 
 
 def _model() -> str:
