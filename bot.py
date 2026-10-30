@@ -107,7 +107,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text("Gagal memproses foto. Cek API key Gemini atau coba lagi nanti.")
 
 
-def _extract_pdf(path: str) -> tuple[str, int]:
+def _extract_pdf(path: str) -> tuple[str, int, list[tuple[int, bytes]]]:
     doc = fitz.open(path)
     sections = []
     ocr_pages = []
