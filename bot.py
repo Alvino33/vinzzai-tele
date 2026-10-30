@@ -248,10 +248,18 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         api_key = os.getenv("GEMINI_API_KEY", "")
         if api_key:
             detail = detail.replace(api_key, "[API KEY DISEMBUNYIKAN]")
-        await update.effective_message.reply_text(
-            "VinAI gagal menghubungi Gemini. Detail error:\n"
-            + detail[:900]
-        )
+        if "timeout" in detail.lower() or "timed out" in detail.lower():
+            message = (
+                "Gemini kelamaan merespons (batas 45 detik). "
+                "Coba kirim pertanyaan sekali lagi beberapa saat nanti.\n\n"
+                "Detail: " + detail[:500]
+            )
+        else:
+            message = (
+                "VinAI gagal menghubungi Gemini. Detail error:\n"
+                + detail[:900]
+            )
+        await update.effective_message.reply_text(message)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
