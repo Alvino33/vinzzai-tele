@@ -16,7 +16,17 @@ from telegram.ext import (
 )
 
 from ai import answer_from_materials, extract_image_text
-from knowledge import add_material, clear_materials, list_materials, retrieve
+from knowledge import (
+    SUBJECTS,
+    add_material,
+    clear_materials,
+    detect_subject,
+    list_materials,
+    list_materials_by_subject,
+    resolve_subject,
+    retrieve,
+    subject_label,
+)
 
 load_dotenv()
 logging.basicConfig(
@@ -39,16 +49,23 @@ async def _send_long(update: Update, text: str) -> None:
         await message.reply_text(text[start:start + 4000])
 
 
+def _subject_help() -> str:
+    return "\n".join(f"• {config['label']}" for config in SUBJECTS.values())
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "Halo! Gue VinAI, asisten belajar dari materi yang lo kirim.\n\n"
-        "Kirim foto atau PDF untuk menyimpan materi.\n"
+        "Kirim foto atau PDF, nanti gue coba kelompokkan otomatis berdasarkan mapel.\n"
         "Perintah:\n"
         "/tambah <teks> — simpan materi teks\n"
-        "/materi — lihat daftar materi\n"
+        "/materi — lihat daftar materi per mapel\n"
+        "/materi ipas — lihat materi mapel tertentu\n"
+        "/mapel — lihat kategori yang didukung\n"
         "/hapus_materi — hapus semua materi akun lo\n"
         "/help — bantuan\n\n"
-        "Setelah materi tersimpan, langsung tanyakan soal lo."
+        "Setelah materi tersimpan, langsung tanyakan soal lo. Gue akan mencoba "
+        "mendeteksi mapelnya otomatis."
     )
 
 
@@ -60,22 +77,59 @@ async def add_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = " ".join(context.args).strip()
     if not text:
         await update.effective_message.reply_text(
-            "Format: /tambah isi materi lo\nContoh: /tambah Fotosintesis adalah proses..."
+            "Format: /tambah isi materi lo\n"
+            "Contoh: /tambah Fotosintesis adalah proses tumbuhan membuat makanan."
         )
         return
-    count = add_material(_user_id(update), "Materi teks", text)
+    subject = detect_subject(text)
+    count = add_material(_user_id(update), "Materi teks", text, subject)
     await update.effective_message.reply_text(
-        f"Materi teks tersimpan. Gue simpan {count} bagian."
+        f"Materi teks tersimpan di mapel {subject_label(subject)} ({count} bagian)."
     )
 
 
 async def show_materials(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    titles = list_materials(_user_id(update))
-    if not titles:
-        await update.effective_message.reply_text("Belum ada materi. Kirim foto/PDF atau pakai /tambah.")
+    requested = " ".join(context.args).strip()
+    if requested:
+        subject = resolve_subject(requested)
+        if not subject:
+            await update.effective_message.reply_text(
+                f"Mapel '{requested}' belum dikenali. Pakai /mapel untuk melihat daftar."
+            )
+            return
+        titles = list_materials(_user_id(update), subject)
+        if not titles:
+            await update.effective_message.reply_text(
+                f"Belum ada materi untuk {subject_label(subject)}."
+            )
+            return
+        listing = "\n".join(f"• {title}" for title in titles)
+        await update.effective_message.reply_text(
+            f"Materi {subject_label(subject)} ({len(titles)}):\n{listing}"
+        )
         return
-    listing = "\n".join(f"• {title}" for title in titles)
-    await update.effective_message.reply_text(f"Materi tersimpan ({len(titles)}):\n{listing}")
+
+    grouped = list_materials_by_subject(_user_id(update))
+    if not grouped:
+        await update.effective_message.reply_text(
+            "Belum ada materi. Kirim foto/PDF atau pakai /tambah."
+        )
+        return
+    lines = []
+    total = 0
+    for subject, titles in grouped.items():
+        total += len(titles)
+        lines.append(f"\n{subject_label(subject)} ({len(titles)}):")
+        lines.extend(f"• {title}" for title in titles)
+    await update.effective_message.reply_text(
+        f"Materi tersimpan ({total} dokumen):\n" + "\n".join(lines)
+    )
+
+
+async def show_subjects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "Kategori mapel yang didukung:\n" + _subject_help()
+    )
 
 
 async def delete_materials(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -94,17 +148,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         image_bytes = bytes(await telegram_file.download_as_bytearray())
         text = await asyncio.to_thread(extract_image_text, image_bytes, "image/jpeg")
         if not text:
-            await message.reply_text("Teksnya belum berhasil terbaca. Coba kirim foto yang lebih jelas.")
+            await message.reply_text(
+                "Teksnya belum berhasil terbaca. Coba kirim foto yang lebih jelas."
+            )
             return
-        count = add_material(_user_id(update), "Foto materi", text)
+        subject = detect_subject(text)
+        count = add_material(_user_id(update), "Foto materi", text, subject)
         preview = text[:700]
         await message.reply_text(
-            f"Foto berhasil dibaca dan disimpan ({count} bagian).\n\n"
-            f"Cuplikan:\n{preview}\n\nSekarang lo bisa tanya isi materinya."
+            f"Foto berhasil dibaca dan disimpan ke {subject_label(subject)} "
+            f"({count} bagian).\n\nCuplikan:\n{preview}\n\n"
+            "Sekarang lo bisa tanya isi materinya."
         )
     except Exception:
         log.exception("Photo processing failed")
-        await message.reply_text("Gagal memproses foto. Cek API key Gemini atau coba lagi nanti.")
+        await message.reply_text(
+            "Gagal memproses foto. Cek API key Gemini atau coba lagi nanti."
+        )
 
 
 def _extract_pdf(path: str) -> tuple[str, int, list[tuple[int, bytes]]]:
@@ -137,10 +197,11 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp:
             temp_path = temp.name
         await telegram_file.download_to_drive(custom_path=temp_path)
-        extracted = await asyncio.to_thread(_extract_pdf, temp_path)
-        text, page_count, ocr_pages = extracted
+        text, page_count, ocr_pages = await asyncio.to_thread(_extract_pdf, temp_path)
         if ocr_pages:
-            await message.reply_text(f"Ada {len(ocr_pages)} halaman scan yang perlu dibaca dengan OCR...")
+            await message.reply_text(
+                f"Ada {len(ocr_pages)} halaman scan yang perlu dibaca dengan OCR..."
+            )
             for page_number, image_bytes in ocr_pages:
                 try:
                     page_text = await asyncio.to_thread(
@@ -154,14 +215,18 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await message.reply_text("Belum ada teks yang berhasil dibaca dari PDF ini.")
             return
         title = (document.file_name or "Dokumen PDF")[:180]
-        count = add_material(_user_id(update), title, text)
+        subject = detect_subject(f"{title}\n{text}")
+        count = add_material(_user_id(update), title, text, subject)
         await message.reply_text(
-            f"PDF berhasil diproses: {page_count} halaman, tersimpan dalam {count} bagian. "
+            f"PDF berhasil diproses: {page_count} halaman, disimpan ke "
+            f"{subject_label(subject)} ({count} bagian). "
             "Sekarang lo bisa tanya isi materinya."
         )
     except Exception:
         log.exception("PDF processing failed")
-        await message.reply_text("Gagal memproses PDF. Pastikan file tidak rusak dan coba lagi.")
+        await message.reply_text(
+            "Gagal memproses PDF. Pastikan file tidak rusak dan coba lagi."
+        )
     finally:
         if temp_path and Path(temp_path).exists():
             Path(temp_path).unlink(missing_ok=True)
@@ -198,6 +263,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("tambah", add_text))
     app.add_handler(CommandHandler("materi", show_materials))
+    app.add_handler(CommandHandler("mapel", show_subjects))
     app.add_handler(CommandHandler("hapus_materi", delete_materials))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
