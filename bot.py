@@ -241,10 +241,16 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         sources = retrieve(_user_id(update), question)
         answer = await asyncio.to_thread(answer_from_materials, question, sources)
         await _send_long(update, answer)
-    except Exception:
+    except Exception as exc:
         log.exception("Answer generation failed")
+        # Tampilkan penyebab teknis tanpa pernah membocorkan API key.
+        detail = f"{type(exc).__name__}: {str(exc)}"
+        api_key = os.getenv("GEMINI_API_KEY", "")
+        if api_key:
+            detail = detail.replace(api_key, "[API KEY DISEMBUNYIKAN]")
         await update.effective_message.reply_text(
-            "Gue gagal membuat jawaban. Cek GEMINI_API_KEY, kuota API, dan nama model."
+            "VinAI gagal menghubungi Gemini. Detail error:\n"
+            + detail[:900]
         )
 
 
